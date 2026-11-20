@@ -28,6 +28,35 @@ def test_parse_tool_call_extracts_valid_block():
         {"command": "curl -sI https://example.com"},
     )
 
+    # Full native DeepSeek DSML XML invoke
+    full_dsml = (
+        '<｜DSML｜ calls>\n'
+        '<｜DSML｜ invoke name="run_command">\n'
+        '<｜DSML｜ parameter name="command" string="true">dig +short edlink.id A</｜DSML｜ parameter>\n'
+        '</｜DSML｜ invoke>\n'
+        '</｜DSML｜ calls>'
+    )
+    assert chat_agent.parse_tool_call(full_dsml) == (
+        "run_command",
+        {"command": "dig +short edlink.id A"},
+    )
+
+    # Multi-parameter DSML with non-string integer
+    multi_dsml = (
+        '<|DSML| invoke name="web_search">\n'
+        '<|DSML| parameter name="query" string="true">edlink.id CVE</|DSML| parameter>\n'
+        '<|DSML| parameter name="max_results" string="false">5</|DSML| parameter>\n'
+        '</|DSML| invoke>'
+    )
+    assert chat_agent.parse_tool_call(multi_dsml) == (
+        "web_search",
+        {"query": "edlink.id CVE", "max_results": 5},
+    )
+
+    # Fenced JSON fallback
+    fenced = '```json\n{"tool": "list_dir", "args": {"path": "."}}\n```'
+    assert chat_agent.parse_tool_call(fenced) == ("list_dir", {"path": "."})
+
 
 def test_tool_web_search_parses_ddg_html(monkeypatch):
     fake_html = """

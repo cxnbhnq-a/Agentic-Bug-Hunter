@@ -215,26 +215,81 @@ TOOLS = {
 CONFIRM_REQUIRED_TOOLS = {"run_command", "http_fetch"}
 
 
+def _parse_dsml_tool_call(reply: str) -> tuple[str, dict] | None:
+    """Parse DeepSeek DSML tool invocation XML (<｜DSML｜ invoke name="...">...)."""
+    inv_match = re.search(
+        r"<[｜|]DSML[｜|]\s*invoke\s+name=[\"']([^\"']+)[\"']\s*>(.*?)(?:</[｜|]DSML[｜|]\s*invoke>|$)",
+        reply,
+        flags=re.DOTALL,
+    )
+    if not inv_match:
+        return None
+    tool_name = inv_match.group(1).strip()
+    body = inv_match.group(2)
+    args: dict = {}
+    for p_match in re.finditer(
+        r"<[｜|]DSML[｜|]\s*parameter\s+name=[\"']([^\"']+)[\"'](?:\s+string=[\"'](true|false)[\"'])?\s*>(.*?)</[｜|]DSML[｜|]\s*parameter>",
+        body,
+        flags=re.DOTALL,
+    ):
+        pname = p_match.group(1).strip()
+        is_str = p_match.group(2)
+        pval = p_match.group(3)
+        if is_str == "false":
+            try:
+                args[pname] = json.loads(pval.strip())
+                continue
+            except ValueError:
+                pass
+        elif pval.strip().startswith("{") and pname == "headers":
+            try:
+                args[pname] = json.loads(pval.strip())
+                continue
+            except ValueError:
+                pass
+        args[pname] = pval.strip() if pname != "data" else pval
+    if tool_name not in TOOLS:
+        return None
+    return tool_name, args
+
+
 def parse_tool_call(reply: str) -> tuple[str, dict] | None:
-    """Extract the first <tool_call>{...} from an LLM reply (tolerates non-standard closing tags)."""
+    """Extract a tool call from <tool_call>, DeepSeek DSML XML, or fenced JSON."""
     if not reply:
         return None
+
+    # 1. Standard <tool_call>{...} (tolerates non-standard closing tags)
     marker = re.search(r"<tool_call>\s*", reply)
-    if not marker:
-        return None
-    tail = reply[marker.end():]
-    brace_idx = tail.find("{")
-    if brace_idx == -1:
-        return None
-    try:
-        data, _ = json.JSONDecoder().raw_decode(tail[brace_idx:])
-    except ValueError:
-        return None
-    if not isinstance(data, dict) or not data.get("tool"):
-        return None
-    tool_name = str(data["tool"]).strip()
-    args = data.get("args") if isinstance(data.get("args"), dict) else {}
-    return tool_name, args
+    if marker:
+        tail = reply[marker.end():]
+        brace_idx = tail.find("{")
+        if brace_idx != -1:
+            try:
+                data, _ = json.JSONDecoder().raw_decode(tail[brace_idx:])
+                if isinstance(data, dict) and data.get("tool"):
+                    tool_name = str(data["tool"]).strip()
+                    args = data.get("args") if isinstance(data.get("args"), dict) else {}
+                    return tool_name, args
+            except ValueError:
+                pass
+
+    # 2. DeepSeek DSML native XML (<｜DSML｜ invoke name="...">...)
+    dsml = _parse_dsml_tool_call(reply)
+    if dsml:
+        return dsml
+
+    # 3. Fenced JSON {"tool": "...", "args": {...}}
+    for fence in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", reply, flags=re.DOTALL):
+        try:
+            data = json.loads(fence.group(1))
+            if isinstance(data, dict) and data.get("tool") in TOOLS:
+                tool_name = str(data["tool"]).strip()
+                args = data.get("args") if isinstance(data.get("args"), dict) else {}
+                return tool_name, args
+        except ValueError:
+            continue
+
+    return None
 
 
 def execute_tool(
