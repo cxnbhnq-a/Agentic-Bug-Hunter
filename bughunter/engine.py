@@ -274,6 +274,7 @@ def cmd_setup(args):
         "10": ("litellm",     "LiteLLM     (100+ providers)    — uses per-provider keys or LITELLM_API_KEY"),
         "11": ("requesty",    "Requesty    (multi-model)       — needs REQUESTY_API_KEY"),
         "12": ("antigravity", "Antigravity / Gemini (Google OAuth — Gemini AI)"),
+        "13": ("custom",      "Custom      (9Router/Local/vLLM)— custom API base URL & model"),
     }
 
     requested_provider = (
@@ -343,6 +344,41 @@ def cmd_setup(args):
                     ok(f"Google OAuth login successful: {creds.get('email', 'authenticated')}")
                 except Exception as exc:
                     warn(f"Browser OAuth skipped ({exc}) — using active Antigravity CLI session")
+
+    elif provider == "custom":
+        existing_base = (cfg.get("CUSTOM_BASE_URL") or os.environ.get("CUSTOM_BASE_URL", "")).strip()
+        req_base = (getattr(args, "setup_base_url", None) or "").strip()
+        if req_base:
+            base_url = req_base
+        else:
+            default_hint = existing_base or "http://localhost:20128/v1"
+            print(f"\nEnter Custom API Base URL (e.g. http://localhost:20128/v1) [{default_hint}]: ", end="")
+            entered_base = input().strip()
+            base_url = entered_base or existing_base or "http://localhost:20128/v1"
+
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/chat/completions"):
+            base_url = base_url[:-len("/chat/completions")].rstrip("/")
+        cfg["CUSTOM_BASE_URL"] = base_url
+        os.environ["CUSTOM_BASE_URL"] = base_url
+
+        existing_key = (cfg.get("CUSTOM_API_KEY") or os.environ.get("CUSTOM_API_KEY", "")).strip()
+        req_key = getattr(args, "setup_api_key", None)
+        if req_key is not None:
+            api_key = req_key.strip()
+        else:
+            key_hint = "blank = keep existing" if existing_key else "optional, blank = none"
+            print(f"Enter CUSTOM_API_KEY ({key_hint}): ", end="")
+            api_key = input().strip()
+
+        if api_key in ("-", "none", "NONE"):
+            cfg.pop("CUSTOM_API_KEY", None)
+            os.environ.pop("CUSTOM_API_KEY", None)
+        elif api_key:
+            cfg["CUSTOM_API_KEY"] = api_key
+            os.environ["CUSTOM_API_KEY"] = api_key
+        elif existing_key:
+            os.environ["CUSTOM_API_KEY"] = existing_key
 
     elif provider in env_map:
         env_var = env_map[provider]
@@ -426,6 +462,35 @@ def cmd_setup(args):
                 cfg.setdefault("models", {})[provider] = selected_model
                 os.environ["BRAIN_MODEL"] = selected_model
                 ok(f"Selected model: {selected_model}")
+        elif provider == "custom" and not requested_model and sys.stdin.isatty():
+            models = client.list_models()
+            saved_models = cfg.get("models", {})
+            current = saved_models.get("custom") if isinstance(saved_models, dict) else None
+            if models:
+                default_index = models.index(current) + 1 if current in models else 1
+                print("\nChoose the Custom Endpoint model BugHunter should use:\n")
+                for index, model_name in enumerate(models, start=1):
+                    marker = " (current)" if model_name == current else ""
+                    print(f"  {index:>2}) {model_name}{marker}")
+                print("   0) Enter custom model name manually")
+                choice = input(f"\nEnter number [{default_index}]: ").strip()
+                if choice == "0":
+                    selected_model = input("Enter model name: ").strip() or current or models[0]
+                else:
+                    try:
+                        selected_model = models[int(choice or default_index) - 1]
+                    except (ValueError, IndexError):
+                        warn("Invalid model choice — using the default selection")
+                        selected_model = models[default_index - 1]
+            else:
+                default_model = current or "default"
+                entered = input(f"\nEnter model name for custom endpoint [{default_model}]: ").strip()
+                selected_model = entered or default_model
+            if not isinstance(cfg.get("models"), dict):
+                cfg["models"] = {}
+            cfg.setdefault("models", {})["custom"] = selected_model
+            os.environ["BRAIN_MODEL"] = selected_model
+            ok(f"Selected model: {selected_model}")
         elif requested_model:
             if provider == "antigravity":
                 sys.path.insert(0, str(HERE))
@@ -441,7 +506,7 @@ def cmd_setup(args):
         save_config(cfg)
         ok(f"Config saved to {CONFIG}")
         reply = client.chat(selected_model, "You are a helpful assistant.",
-                            "Reply with exactly: READY", max_tokens=10)
+                            "Reply with exactly: READY", max_tokens=128)
         ok(f"Model responded: {reply.strip()}" if reply else "Connected (no reply — pull a model if using Ollama)")
     else:
         if not requested_model:
@@ -454,6 +519,8 @@ def cmd_setup(args):
             print(f"\n  {YELLOW}Install Ollama:{NC}")
             print("    curl -fsSL https://ollama.ai/install.sh | sh")
             print("    ollama pull qwen2.5:14b")
+        elif provider == "custom":
+            print(f"\n  {YELLOW}Check endpoint:{NC}  export CUSTOM_BASE_URL=http://localhost:20128/v1")
         elif provider in env_map:
             print(f"\n  {YELLOW}Set API key:{NC}  export {env_map[provider]}=your_key_here")
 
@@ -504,7 +571,7 @@ def cmd_login(args):
     cfg = load_config()
     cfg["provider"] = "antigravity"
     cfg.setdefault("models", {})["antigravity"] = (
-        getattr(args, "model", None) or cfg.get("models", {}).get("antigravity") or "gemini-4-argon-high"
+        getattr(args, "model", None) or cfg.get("models", {}).get("antigravity") or "gemini-3.8-flash-medium"
     )
     save_config(cfg)
     ok(f"Active provider set to 'antigravity' (model: {cfg['models']['antigravity']})")
@@ -538,6 +605,7 @@ def cmd_providers(args):
         "orcarouter":   "ORCAROUTER_API_KEY",
         "fluxion":      "FLUXION_API_KEY",
         "requesty":     "REQUESTY_API_KEY",
+        "custom":       "CUSTOM_BASE_URL",
     }
     tier = {
         "ollama":       "FREE (local)",
@@ -551,6 +619,7 @@ def cmd_providers(args):
         "orcarouter":   "subscription",
         "fluxion":      "subscription",
         "requesty":     "pay-as-you-go",
+        "custom":       "custom endpoint",
     }
 
     print(f"\n  {'PROVIDER':<14} {'TIER':<16} {'STATUS':<22} {'NOTE'}")
@@ -786,18 +855,39 @@ def cmd_chain(args):
 
 
 def cmd_chat(args):
-    """Interactive Q&A shell."""
-    header("BugHunter Chat")
+    """Interactive agentic Q&A shell with network, web search, file, and shell tools."""
+    header("BugHunter Chat (Agentic)")
     client = _get_client()
     if not client.available:
         err("No AI provider available. Run: ./engine.py setup")
         sys.exit(1)
 
     sys.path.insert(0, str(HERE))
-    from brain import BRAIN_SYSTEM  # noqa: PLC0415
+    from tools.chat_agent import run_chat_turn  # noqa: PLC0415
 
+    auto_approve = bool(getattr(args, "auto", False))
     ok(f"Connected: {client.description}")
-    print(f"{DIM}Type 'exit' or Ctrl+C to quit{NC}\n")
+    info("Tools enabled: web_search, http_fetch, run_command, read_file, list_dir")
+    print(
+        f"{DIM}Commands: /auto (toggle tool auto-approve: {'ON' if auto_approve else 'OFF'}), "
+        f"/clear, /help, exit{NC}\n"
+    )
+
+    def _confirm_tool(tool_name: str, tool_args: dict) -> str:
+        summary = tool_args.get("command") or tool_args.get("url") or str(tool_args)
+        ans = input(f"  {YELLOW}Allow {tool_name} ({summary})? [Y/n/a(always)]: {NC}").strip().lower()
+        return ans
+
+    def _on_tool_event(phase: str, tool_name: str, tool_args: dict, result: str | None) -> None:
+        if phase == "start":
+            detail = (
+                tool_args.get("query")
+                or tool_args.get("url")
+                or tool_args.get("command")
+                or tool_args.get("path")
+                or ""
+            )
+            print(f"  {CYAN}[Tool]{NC} {tool_name} {DIM}{detail}{NC}")
 
     history: list[dict] = []
     while True:
@@ -811,14 +901,29 @@ def cmd_chat(args):
             break
         if not user_input:
             continue
+        if user_input.lower() == "/clear":
+            history.clear()
+            ok("Conversation history cleared")
+            continue
+        if user_input.lower() == "/auto":
+            auto_approve = not auto_approve
+            ok(f"Tool auto-approve: {'ON' if auto_approve else 'OFF'}")
+            continue
+        if user_input.lower() == "/help":
+            print(
+                f"  {BOLD}Tools:{NC} web_search, http_fetch, run_command, read_file, list_dir\n"
+                f"  {BOLD}Commands:{NC} /auto (toggle confirmation), /clear (reset history), exit"
+            )
+            continue
 
-        ctx_parts = []
-        for turn in history[-4:]:
-            ctx_parts.append(f"[you] {turn['user']}")
-            ctx_parts.append(f"[assistant] {turn['assistant']}")
-        prompt = ("\n".join(ctx_parts) + "\n\n" if ctx_parts else "") + f"[you] {user_input}"
-
-        reply = client.chat(None, BRAIN_SYSTEM, prompt, max_tokens=2000)
+        reply, auto_approve = run_chat_turn(
+            client,
+            user_input,
+            history,
+            auto_approve=auto_approve,
+            confirm_fn=_confirm_tool,
+            on_tool_event=_on_tool_event,
+        )
         if reply:
             print(f"\n{reply}\n")
             history.append({"user": user_input, "assistant": reply})
@@ -942,7 +1047,7 @@ def main():
         """),
     )
     parser.add_argument("--provider", "-p",
-                        help="Force provider: ollama / gemini-oauth / antigravity / gemini / groq / deepseek / claude / openai / grok / openrouter / orcarouter / fluxion / litellm / requesty")
+                        help="Force provider: ollama / gemini-oauth / antigravity / gemini / groq / deepseek / claude / openai / grok / openrouter / orcarouter / fluxion / litellm / requesty / custom")
     parser.add_argument("--model", "-m", help="Force model for this invocation (for example qwen3:14b)")
     parser.add_argument("--no-banner", action="store_true", help="Suppress banner")
 
@@ -953,12 +1058,20 @@ def main():
         "--provider", dest="setup_provider",
         choices=["ollama", "groq", "deepseek", "claude", "openai", "grok",
                  "openrouter", "orcarouter", "fluxion", "litellm", "requesty",
-                 "gemini", "gemini-oauth", "google-oauth", "antigravity", "agy"],
+                 "gemini", "gemini-oauth", "google-oauth", "antigravity", "agy", "custom"],
         help="Provider to persist (skips the provider prompt)",
     )
     p_setup.add_argument(
         "--model", dest="setup_model",
         help="Model to persist; an Ollama model must already be installed",
+    )
+    p_setup.add_argument(
+        "--base-url", dest="setup_base_url",
+        help="Custom API base URL (used with --provider custom, e.g. http://localhost:20128/v1)",
+    )
+    p_setup.add_argument(
+        "--api-key", dest="setup_api_key",
+        help="Optional API key for custom endpoint (used with --provider custom)",
     )
 
     p_login = sub.add_parser("login", aliases=["auth"], help="Login with Google OAuth (Gemini AI Pro)")
@@ -968,7 +1081,8 @@ def main():
     sub.add_parser("providers", aliases=["p"], help="Show all providers + API key status")
     sub.add_parser("models",    aliases=["m"], help="List available models for active provider")
     sub.add_parser("status",    aliases=["s"], help="Show hunt pipeline status")
-    sub.add_parser("chat",      aliases=["ask"], help="Interactive AI shell")
+    p_chat = sub.add_parser("chat", aliases=["ask"], help="Interactive agentic AI shell (network, web search, shell)")
+    p_chat.add_argument("--auto", action="store_true", help="Auto-approve tool execution without prompting")
 
     p_recon = sub.add_parser("recon", aliases=["r"], help="Recon + AI surface analysis")
     p_recon.add_argument("target", help="Target domain or IP")
@@ -1012,7 +1126,8 @@ def main():
     for env_var in ("GROQ_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY",
                     "OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY",
                     "ORCAROUTER_API_KEY", "FLUXION_API_KEY", "REQUESTY_API_KEY",
-                    "GEMINI_API_KEY"):
+                    "GEMINI_API_KEY", "CUSTOM_BASE_URL", "CUSTOM_API_BASE",
+                    "CUSTOM_API_KEY"):
         if not os.environ.get(env_var) and cfg.get(env_var):
             os.environ[env_var] = cfg[env_var]
 

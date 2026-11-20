@@ -200,8 +200,8 @@ class LLMClient:
         "groq":        "openai/gpt-oss-20b",
         "deepseek":    "deepseek-v4-flash",
         "gemini":      "gemini-3.8-flash-high",
-        "gemini-oauth": "gemini-3.8-flash-high",
-        "antigravity": "gemini-3.8-flash-high",
+        "gemini-oauth": "gemini-3.8-flash-medium",
+        "antigravity": "gemini-3.8-flash-medium",
         "kimi":        "moonshot-v1-128k",
         "mistral":     "mistral-large-latest",
         "together":    "meta-llama/Llama-3.3-70B-Instruct-Turbo",
@@ -212,6 +212,7 @@ class LLMClient:
         "fluxion":     "openai/gpt-4o",
         "requesty":    "anthropic/claude-sonnet-4-6",
         "litellm":     "gpt-4o",
+        "custom":      None,  # resolved dynamically or from config
         "ollama":      None,  # resolved dynamically
     }
 
@@ -549,6 +550,24 @@ class LLMClient:
             self.available   = True
             self.description = "LiteLLM (100+ provider gateway)"
 
+        elif provider == "custom":
+            base = (os.environ.get("CUSTOM_BASE_URL", "")
+                    or os.environ.get("CUSTOM_API_BASE", "")).strip().rstrip("/")
+            if base.endswith("/chat/completions"):
+                base = base[:-len("/chat/completions")].rstrip("/")
+            if not base:
+                return
+            import requests
+            self._http = requests.Session()
+            headers = {"Content-Type": "application/json"}
+            key = os.environ.get("CUSTOM_API_KEY", "").strip()
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            self._http.headers.update(headers)
+            self._api_base   = base
+            self.available   = True
+            self.description = f"Custom OpenAI-compatible ({base})"
+
     def _init_antigravity_oauth(self) -> None:
         """Initialize unified Google Antigravity / Gemini AI Pro (Google OAuth) backend."""
         try:
@@ -590,7 +609,7 @@ class LLMClient:
             elif self.provider in (
                 "openai", "grok", "groq", "deepseek",
                 "gemini", "kimi", "mistral", "together", "cerebras", "perplexity",
-                "openrouter", "orcarouter", "fluxion", "requesty",
+                "openrouter", "orcarouter", "fluxion", "requesty", "custom",
             ):
                 return self._chat_openai_compat(model, system, user, max_tokens, temperature)
         except Exception as e:
@@ -697,7 +716,10 @@ class LLMClient:
     def _chat_openai_compat(self, model, system, user, max_tokens, temperature) -> str:
         import json as _json
         base = self._api_base
-        m    = model or self.DEFAULT_MODELS[self.provider]
+        m    = model or self.DEFAULT_MODELS.get(self.provider)
+        if not m and self.provider == "custom":
+            avail = self.list_models()
+            m = avail[0] if avail else "default"
         if self.provider == "grok":
             m = self.GROK_LEGACY_ALIASES.get(m, m)
         elif self.provider == "groq":
@@ -721,7 +743,61 @@ class LLMClient:
                 f"to a supported one."
             )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        return self._extract_openai_compat_text(r)
+
+    @staticmethod
+    def _extract_openai_compat_text(r) -> str:
+        """Parse OpenAI-compatible JSON, trailing-SSE JSON, or SSE chunk streams."""
+        import json as _json
+
+        def _from_payload(data: dict) -> str:
+            choices = data.get("choices") or []
+            if not choices:
+                return ""
+            msg = choices[0].get("message") or choices[0].get("delta") or {}
+            content = (msg.get("content") or "").strip()
+            if not content:
+                content = (msg.get("reasoning_content") or "").strip()
+            return content
+
+        try:
+            return _from_payload(r.json())
+        except ValueError:
+            pass
+
+        text = (getattr(r, "text", "") or "").lstrip()
+        if text.startswith("{"):
+            try:
+                obj, _ = _json.JSONDecoder().raw_decode(text)
+                if isinstance(obj, dict):
+                    return _from_payload(obj)
+            except ValueError:
+                pass
+
+        parts: list[str] = []
+        reasoning_parts: list[str] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = _json.loads(payload)
+            except ValueError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            msg = choices[0].get("delta") or choices[0].get("message") or {}
+            if msg.get("content"):
+                parts.append(msg["content"])
+            elif msg.get("reasoning_content"):
+                reasoning_parts.append(msg["reasoning_content"])
+        if parts:
+            return "".join(parts).strip()
+        return "".join(reasoning_parts).strip()
 
     def list_models(self) -> list[str]:
         """List available models for the current provider."""
@@ -812,6 +888,32 @@ class LLMClient:
             ]
         elif self.provider == "litellm":
             return self._litellm_list_models()
+        elif self.provider == "custom":
+            return self._custom_list_models()
+        return []
+
+    def _custom_list_models(self) -> list[str]:
+        """Query an OpenAI-compatible custom endpoint's /models list."""
+        if not self._http or not getattr(self, "_api_base", ""):
+            return []
+        try:
+            r = self._http.get(f"{self._api_base}/models", timeout=10)
+            r.raise_for_status()
+            payload = r.json()
+            if isinstance(payload, dict):
+                if isinstance(payload.get("data"), list):
+                    return [m["id"] for m in payload["data"] if isinstance(m, dict) and m.get("id")]
+                if isinstance(payload.get("models"), list):
+                    return [
+                        m.get("id") or m.get("name") or m.get("model")
+                        for m in payload["models"]
+                        if isinstance(m, dict) and (m.get("id") or m.get("name") or m.get("model"))
+                    ]
+        except Exception as e:
+            print(
+                f"{YELLOW}[Brain] Could not list custom endpoint models: {e}{NC}",
+                file=sys.stderr,
+            )
         return []
 
     def _antigravity_list_models(self) -> list[str]:
