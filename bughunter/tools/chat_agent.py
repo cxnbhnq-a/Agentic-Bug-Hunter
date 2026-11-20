@@ -14,6 +14,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 MAX_OUTPUT_CHARS = 6000
 MAX_TOOL_STEPS = 8
 
+PHASE_DESCRIPTIONS = {
+    0: "Scope & Context",
+    1: "Reconnaissance",
+    2: "Surface Ranking",
+    3: "Targeted Hunting",
+    4: "Validation (7-Question Gate)",
+    5: "PoC & Reporting",
+}
+
+CHAT_SESSIONS_DIR = Path.home() / ".bughunter" / "chat_sessions"
+
 CHAT_AGENT_SYSTEM = """You are BugHunter AI, an expert Bug Bounty & Penetration Testing assistant running inside the user's terminal.
 You DO have real network access, web search, HTTP request capability, local file access, and shell command execution via tools.
 Never claim "I have no network access" — use your tools whenever you need live data, CVE research, recon, or endpoint testing.
@@ -47,6 +58,7 @@ Rules:
 - Emit at most ONE <tool_call> per response, then wait for <tool_result>.
 - Always close with </tool_call>. Keep run_command short and focused (1-3 commands max per call, never giant multi-section scripts).
 - Never fabricate tool outputs, URLs, or findings you did not observe in <tool_result>.
+- Do NOT create temporary or duplicate files in the current working directory unless explicitly requested; reuse existing recon/findings data.
 - Separate confirmed observations from unverified hypotheses.
 - Be concise, practical, and security-focused. Match the user's language."""
 
@@ -327,6 +339,75 @@ def execute_tool(
         return f"Tool {tool_name} failed: {exc}", auto_approve
 
 
+def _safe_target_key(target: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", target.strip().lower()) or "default"
+
+
+def load_chat_session(target: str, sessions_dir: Path | None = None) -> dict:
+    """Load saved per-target chat session (single file, zero clutter)."""
+    base = sessions_dir or CHAT_SESSIONS_DIR
+    path = base / f"{_safe_target_key(target)}.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_chat_session(
+    target: str,
+    phase: int | None,
+    history: list[dict],
+    sessions_dir: Path | None = None,
+) -> Path:
+    """Persist per-target chat state to a single overwritten JSON file."""
+    base = sessions_dir or CHAT_SESSIONS_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"{_safe_target_key(target)}.json"
+    payload = {
+        "target": target,
+        "phase": phase,
+        "history": history[-8:],
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
+def build_target_context(target: str, recon_root: Path, findings_root: Path) -> str:
+    """Summarize existing recon/findings files for a target without duplicating them."""
+    if not target:
+        return ""
+    safe = _safe_target_key(target)
+    parts: list[str] = []
+
+    recon_dir = recon_root / target
+    if not recon_dir.is_dir():
+        recon_dir = recon_root / safe
+    if recon_dir.is_dir():
+        parts.append(f"Existing recon directory: {recon_dir}")
+        for rel in ("subdomains/all.txt", "live/urls.txt", "urls/with_params.txt", "urls/js_files.txt"):
+            fpath = recon_dir / rel
+            if fpath.is_file():
+                lines = [ln.strip() for ln in fpath.read_text(errors="replace").splitlines() if ln.strip()]
+                parts.append(f"- {rel}: {len(lines)} entries")
+                if rel in ("live/urls.txt", "urls/with_params.txt") and lines:
+                    sample = "\n  ".join(lines[:10])
+                    parts.append(f"  Sample:\n  {sample}")
+
+    findings_dir = findings_root / target
+    if not findings_dir.is_dir():
+        findings_dir = findings_root / safe
+    if findings_dir.is_dir():
+        parts.append(f"Existing findings directory: {findings_dir}")
+        summary = findings_dir / "summary.txt"
+        if summary.is_file():
+            parts.append("Findings summary:\n" + _truncate(summary.read_text(errors="replace"), 1500))
+
+    return "\n".join(parts)
+
+
 def run_chat_turn(
     client,
     user_input: str,
@@ -335,14 +416,30 @@ def run_chat_turn(
     confirm_fn: Callable[[str, dict], str] | None = None,
     on_tool_event: Callable[[str, str, dict, str | None], None] | None = None,
     max_tokens: int = 4096,
+    phase: int | None = None,
+    target: str | None = None,
+    target_context: str = "",
 ) -> tuple[str, bool]:
     """Run one user turn with multi-step tool calling, returning (final_reply, auto_approve)."""
     ctx_parts = []
+    if target or phase is not None or target_context:
+        header_lines = []
+        if target:
+            header_lines.append(f"[Active Target: {target}]")
+        if phase is not None and phase in PHASE_DESCRIPTIONS:
+            header_lines.append(
+                f"[Active Phase: Phase {phase} — {PHASE_DESCRIPTIONS[phase]}. "
+                f"Focus directly on Phase {phase}; do not repeat earlier phases unless asked.]"
+            )
+        if target_context:
+            header_lines.append(f"[Existing Target Data]\n{target_context}")
+        ctx_parts.append("\n".join(header_lines))
+
     for turn in history[-4:]:
         ctx_parts.append(f"[you] {turn['user']}")
         ctx_parts.append(f"[assistant] {turn['assistant']}")
 
-    conversation = ("\n".join(ctx_parts) + "\n\n" if ctx_parts else "") + f"[you] {user_input}"
+    conversation = ("\n\n".join(ctx_parts) + "\n\n" if ctx_parts else "") + f"[you] {user_input}"
 
     for _ in range(MAX_TOOL_STEPS):
         reply = client.chat(None, CHAT_AGENT_SYSTEM, conversation, max_tokens=max_tokens)

@@ -134,3 +134,48 @@ def test_run_chat_turn_executes_tool_then_answers(monkeypatch):
     assert reply == "Found 1 result: Example CVE result."
     assert auto is True
     assert fake_client.chat.call_count == 2
+
+
+def test_session_persistence_and_target_context(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    recon_root = tmp_path / "recon"
+    findings_root = tmp_path / "findings"
+
+    (recon_root / "edlink.id" / "live").mkdir(parents=True)
+    (recon_root / "edlink.id" / "live" / "urls.txt").write_text("https://edlink.id\nhttps://api.edlink.id\n")
+    (findings_root / "edlink.id").mkdir(parents=True)
+    (findings_root / "edlink.id" / "summary.txt").write_text("TOTAL FINDINGS: 1\n- CORS on api.edlink.id\n")
+
+    ctx = chat_agent.build_target_context("edlink.id", recon_root, findings_root)
+    assert "live/urls.txt: 2 entries" in ctx
+    assert "https://api.edlink.id" in ctx
+    assert "CORS on api.edlink.id" in ctx
+
+    # Save twice — must overwrite single file, not create clutter
+    p1 = chat_agent.save_chat_session("edlink.id", 2, [{"user": "u1", "assistant": "a1"}], sessions_dir)
+    p2 = chat_agent.save_chat_session("edlink.id", 3, [{"user": "u2", "assistant": "a2"}], sessions_dir)
+    assert p1 == p2
+    assert len(list(sessions_dir.iterdir())) == 1
+
+    loaded = chat_agent.load_chat_session("edlink.id", sessions_dir)
+    assert loaded["phase"] == 3
+    assert loaded["history"] == [{"user": "u2", "assistant": "a2"}]
+
+
+def test_run_chat_turn_injects_phase_and_target_context():
+    fake_client = MagicMock()
+    fake_client.chat.return_value = "Testing IDOR on api.edlink.id"
+
+    reply, _ = chat_agent.run_chat_turn(
+        fake_client,
+        "lanjut hunt",
+        [],
+        phase=3,
+        target="edlink.id",
+        target_context="live/urls.txt: 2 entries",
+    )
+    assert reply == "Testing IDOR on api.edlink.id"
+    sent_prompt = fake_client.chat.call_args.args[2]
+    assert "[Active Target: edlink.id]" in sent_prompt
+    assert "[Active Phase: Phase 3 — Targeted Hunting." in sent_prompt
+    assert "live/urls.txt: 2 entries" in sent_prompt

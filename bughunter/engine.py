@@ -863,13 +863,47 @@ def cmd_chat(args):
         sys.exit(1)
 
     sys.path.insert(0, str(HERE))
-    from tools.chat_agent import run_chat_turn  # noqa: PLC0415
+    from tools.chat_agent import (  # noqa: PLC0415
+        PHASE_DESCRIPTIONS,
+        build_target_context,
+        load_chat_session,
+        run_chat_turn,
+        save_chat_session,
+    )
 
     auto_approve = bool(getattr(args, "auto", False))
+    target = (getattr(args, "target", None) or "").strip() or None
+    phase = getattr(args, "phase", None)
+    history: list[dict] = []
+    target_context = ""
+
+    def _activate_target(new_target: str, explicit_phase: int | None = None) -> None:
+        nonlocal target, phase, history, target_context
+        target = new_target.strip()
+        saved = load_chat_session(target)
+        history = list(saved.get("history") or [])
+        if explicit_phase is not None:
+            phase = explicit_phase
+        elif saved.get("phase") is not None:
+            phase = saved["phase"]
+        target_context = build_target_context(target, RECON, FINDINGS)
+        parts = [f"Target: {target}"]
+        if phase is not None and phase in PHASE_DESCRIPTIONS:
+            parts.append(f"Phase {phase} ({PHASE_DESCRIPTIONS[phase]})")
+        if history:
+            parts.append(f"resumed {len(history)} turn(s)")
+        if target_context:
+            parts.append("recon/findings context loaded")
+        info(" | ".join(parts))
+
     ok(f"Connected: {client.description}")
     info("Tools enabled: web_search, http_fetch, run_command, read_file, list_dir")
+    if target:
+        _activate_target(target, explicit_phase=phase)
+    elif phase is not None and phase in PHASE_DESCRIPTIONS:
+        info(f"Starting at Phase {phase} ({PHASE_DESCRIPTIONS[phase]})")
     print(
-        f"{DIM}Commands: /auto (toggle tool auto-approve: {'ON' if auto_approve else 'OFF'}), "
+        f"{DIM}Commands: /phase <0-5>, /target <domain>, /auto ({'ON' if auto_approve else 'OFF'}), "
         f"/clear, /help, exit{NC}\n"
     )
 
@@ -878,8 +912,8 @@ def cmd_chat(args):
         ans = input(f"  {YELLOW}Allow {tool_name} ({summary})? [Y/n/a(always)]: {NC}").strip().lower()
         return ans
 
-    def _on_tool_event(phase: str, tool_name: str, tool_args: dict, result: str | None) -> None:
-        if phase == "start":
+    def _on_tool_event(ev_phase: str, tool_name: str, tool_args: dict, result: str | None) -> None:
+        if ev_phase == "start":
             detail = (
                 tool_args.get("query")
                 or tool_args.get("url")
@@ -889,7 +923,6 @@ def cmd_chat(args):
             )
             print(f"  {CYAN}[Tool]{NC} {tool_name} {DIM}{detail}{NC}")
 
-    history: list[dict] = []
     while True:
         try:
             user_input = input(f"{CYAN}{BOLD}you>{NC} ").strip()
@@ -903,16 +936,36 @@ def cmd_chat(args):
             continue
         if user_input.lower() == "/clear":
             history.clear()
+            if target:
+                save_chat_session(target, phase, history)
             ok("Conversation history cleared")
             continue
         if user_input.lower() == "/auto":
             auto_approve = not auto_approve
             ok(f"Tool auto-approve: {'ON' if auto_approve else 'OFF'}")
             continue
+        if user_input.lower().startswith("/phase"):
+            arg_str = user_input[6:].strip()
+            if arg_str.isdigit() and int(arg_str) in PHASE_DESCRIPTIONS:
+                phase = int(arg_str)
+                if target:
+                    save_chat_session(target, phase, history)
+                ok(f"Active phase: Phase {phase} — {PHASE_DESCRIPTIONS[phase]}")
+            else:
+                lines = [f"  {k}: {v}" for k, v in PHASE_DESCRIPTIONS.items()]
+                print("Usage: /phase <0-5>\n" + "\n".join(lines))
+            continue
+        if user_input.lower().startswith("/target"):
+            new_t = user_input[7:].strip()
+            if new_t:
+                _activate_target(new_t, explicit_phase=None)
+            else:
+                print(f"Current target: {target or '(none)'} — Usage: /target example.com")
+            continue
         if user_input.lower() == "/help":
             print(
                 f"  {BOLD}Tools:{NC} web_search, http_fetch, run_command, read_file, list_dir\n"
-                f"  {BOLD}Commands:{NC} /auto (toggle confirmation), /clear (reset history), exit"
+                f"  {BOLD}Commands:{NC} /phase <0-5>, /target <domain>, /auto, /clear, exit"
             )
             continue
 
@@ -923,10 +976,15 @@ def cmd_chat(args):
             auto_approve=auto_approve,
             confirm_fn=_confirm_tool,
             on_tool_event=_on_tool_event,
+            phase=phase,
+            target=target,
+            target_context=target_context,
         )
         if reply:
             print(f"\n{reply}\n")
             history.append({"user": user_input, "assistant": reply})
+            if target:
+                save_chat_session(target, phase, history)
         else:
             warn("No response — check provider with: ./engine.py providers")
 
@@ -1083,6 +1141,8 @@ def main():
     sub.add_parser("status",    aliases=["s"], help="Show hunt pipeline status")
     p_chat = sub.add_parser("chat", aliases=["ask"], help="Interactive agentic AI shell (network, web search, shell)")
     p_chat.add_argument("--auto", action="store_true", help="Auto-approve tool execution without prompting")
+    p_chat.add_argument("--phase", type=int, choices=[0, 1, 2, 3, 4, 5], help="Start directly at Bug Hunter Phase 0-5")
+    p_chat.add_argument("--target", "-t", help="Target domain to load existing recon/findings & resume session")
 
     p_recon = sub.add_parser("recon", aliases=["r"], help="Recon + AI surface analysis")
     p_recon.add_argument("target", help="Target domain or IP")
