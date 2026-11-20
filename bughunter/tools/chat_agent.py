@@ -37,6 +37,7 @@ To call a tool, output ONLY a <tool_call> block with valid JSON:
 
 Rules:
 - Emit at most ONE <tool_call> per response, then wait for <tool_result>.
+- Always close with </tool_call>. Keep run_command short and focused (1-3 commands max per call, never giant multi-section scripts).
 - Never fabricate tool outputs, URLs, or findings you did not observe in <tool_result>.
 - Be concise, practical, and security-focused. Match the user's language."""
 
@@ -215,15 +216,18 @@ CONFIRM_REQUIRED_TOOLS = {"run_command", "http_fetch"}
 
 
 def parse_tool_call(reply: str) -> tuple[str, dict] | None:
-    """Extract the first <tool_call>{...}</tool_call> from an LLM reply."""
+    """Extract the first <tool_call>{...} from an LLM reply (tolerates non-standard closing tags)."""
     if not reply:
         return None
-    m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", reply, flags=re.DOTALL)
-    if not m:
+    marker = re.search(r"<tool_call>\s*", reply)
+    if not marker:
         return None
-    raw = m.group(1).strip()
+    tail = reply[marker.end():]
+    brace_idx = tail.find("{")
+    if brace_idx == -1:
+        return None
     try:
-        data = json.loads(raw)
+        data, _ = json.JSONDecoder().raw_decode(tail[brace_idx:])
     except ValueError:
         return None
     if not isinstance(data, dict) or not data.get("tool"):
@@ -266,7 +270,7 @@ def run_chat_turn(
     auto_approve: bool = False,
     confirm_fn: Callable[[str, dict], str] | None = None,
     on_tool_event: Callable[[str, str, dict, str | None], None] | None = None,
-    max_tokens: int = 2000,
+    max_tokens: int = 4096,
 ) -> tuple[str, bool]:
     """Run one user turn with multi-step tool calling, returning (final_reply, auto_approve)."""
     ctx_parts = []

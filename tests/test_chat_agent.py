@@ -21,6 +21,13 @@ def test_parse_tool_call_extracts_valid_block():
     assert chat_agent.parse_tool_call("Just plain text") is None
     assert chat_agent.parse_tool_call("<tool_call>{bad json}</tool_call>") is None
 
+    # DeepSeek DSML closing tag variant
+    dsml = '<tool_call>\n{"tool": "run_command", "args": {"command": "curl -sI https://example.com"}}\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>'
+    assert chat_agent.parse_tool_call(dsml) == (
+        "run_command",
+        {"command": "curl -sI https://example.com"},
+    )
+
 
 def test_tool_web_search_parses_ddg_html(monkeypatch):
     fake_html = """
